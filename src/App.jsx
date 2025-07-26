@@ -1,72 +1,212 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import PropTypes from 'prop-types';
 
-// Optional Automerge import for P2P sync
-let Automerge;
-try {
-  Automerge = require('@automerge/automerge');
-} catch (e) {
-  console.warn('Automerge not available - P2P sync disabled');
-}
+// Extracted constants to avoid magic numbers and repeated values
+const CONSTANTS = {
+  MUTUAL_FOLLOWERS_NORMALIZER: 10,
+  ACTIVITY_DECAY_DAYS: 30,
+  RECENT_ACTIVITY_DAYS: 7,
+  WEBSOCKET_READY_STATE: 1,
+  AVATAR_SIZE: 144,
+  CONNECT_DELAY_MS: 800,
+  STORAGE_RETRY_DELAY: 1000,
+  MAX_INTERESTS_DISPLAY: 3,
+  CARD_ANIMATION_DURATION: 300,
+  WEBSOCKET_TIMEOUT: 5000
+};
 
-/**
- * Default ranking weights for friend suggestions
- */
-const DEFAULT_RANKING_WEIGHTS = {
+const DEFAULT_RANKING_WEIGHTS = Object.freeze({
   mutualFollowers: 0.4,
   recentActivity: 0.2,
   sharedInterests: 0.25,
   commonGroups: 0.15
+});
+
+const SAMPLE_USERS = Object.freeze([
+  {
+    id: 'user456',
+    name: 'Jane Smith',
+    avatar: 'https://images.unsplash.com/photo-1494790108755-2616b612b786?w=150&h=150&fit=crop&crop=face',
+    interests: ['music', 'art', 'travel'],
+    groups: ['developers', 'artists'],
+    lastActive: Date.now() - 86400000,
+    isOnline: false
+  },
+  {
+    id: 'user789',
+    name: 'Bob Johnson',
+    avatar: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150&h=150&fit=crop&crop=face',
+    interests: ['tech', 'travel', 'gaming'],
+    groups: ['developers', 'gamers'],
+    lastActive: Date.now() - 3600000,
+    isOnline: true
+  },
+  {
+    id: 'user101',
+    name: 'Alice Brown',
+    avatar: 'https://images.unsplash.com/photo-1438761681033-6461ffad8d80?w=150&h=150&fit=crop&crop=face',
+    interests: ['cooking', 'music', 'yoga'],
+    groups: ['music-lovers', 'health'],
+    lastActive: Date.now() - 7200000,
+    isOnline: true
+  },
+  {
+    id: 'user202',
+    name: 'Charlie Wilson',
+    interests: ['tech', 'gaming', 'music'],
+    groups: ['developers', 'gamers'],
+    lastActive: Date.now() - 1800000,
+    isOnline: true
+  },
+  {
+    id: 'user303',
+    name: 'Diana Ross',
+    avatar: 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=150&h=150&fit=crop&crop=face',
+    interests: ['music', 'art', 'cooking'],
+    groups: ['music-lovers', 'artists'],
+    lastActive: Date.now() - 10800000,
+    isOnline: false
+  },
+  {
+    id: 'user404',
+    name: 'Emma Wilson',
+    avatar: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&h=150&fit=crop&crop=face',
+    interests: ['yoga', 'travel', 'photography'],
+    groups: ['health', 'photographers'],
+    lastActive: Date.now() - 5400000,
+    isOnline: true
+  }
+]);
+
+// Optional Automerge import with proper error handling
+const loadAutomerge = () => {
+  try {
+    return require('@automerge/automerge');
+  } catch (error) {
+    console.warn('Automerge not available - P2P sync disabled:', error.message);
+    return null;
+  }
+};
+
+const Automerge = loadAutomerge();
+
+/**
+ * Validation schemas for type safety
+ */
+const ValidationSchema = {
+  user: {
+    requiredFields: ['id', 'name'],
+    optionalFields: ['avatar', 'interests', 'groups', 'lastActive', 'isOnline']
+  },
+  connection: {
+    requiredFields: ['userId'],
+    optionalFields: ['strength', 'mutualFollowers']
+  }
 };
 
 /**
- * Validate and normalize user data
+ * Safe data validator with comprehensive error handling
+ * @param {unknown} data - Data to validate
+ * @param {object} schema - Validation schema
+ * @returns {object|null} Validated data or null
  */
-const validateUser = (user) => {
-  if (!user || typeof user !== 'object' || !user.id || !user.name) {
+const validateData = (data, schema) => {
+  if (!data || typeof data !== 'object') {
     return null;
   }
-  
-  return {
-    id: String(user.id),
-    name: String(user.name),
-    avatar: user.avatar || '',
-    interests: Array.isArray(user.interests) ? user.interests : [],
-    groups: Array.isArray(user.groups) ? user.groups : [],
-    lastActive: typeof user.lastActive === 'number' ? user.lastActive : Date.now(),
-    isOnline: Boolean(user.isOnline)
-  };
+
+  const hasRequiredFields = schema.requiredFields.every(field => {
+    const value = data[field];
+    return value !== null && value !== undefined && value !== '';
+  });
+
+  if (!hasRequiredFields) {
+    return null;
+  }
+
+  return data;
+};
+
+/**
+ * Validate and normalize user data with comprehensive type checking
+ * @param {unknown} user - User data to validate
+ * @returns {object|null} Validated user or null
+ */
+const validateUser = (user) => {
+  const validatedUser = validateData(user, ValidationSchema.user);
+  if (!validatedUser) {
+    return null;
+  }
+
+  try {
+    return {
+      id: String(validatedUser.id),
+      name: String(validatedUser.name).trim(),
+      avatar: validatedUser.avatar ? String(validatedUser.avatar) : '',
+      interests: Array.isArray(validatedUser.interests) ? validatedUser.interests : [],
+      groups: Array.isArray(validatedUser.groups) ? validatedUser.groups : [],
+      lastActive: typeof validatedUser.lastActive === 'number' ? validatedUser.lastActive : Date.now(),
+      isOnline: Boolean(validatedUser.isOnline)
+    };
+  } catch (error) {
+    console.error('User validation error:', error);
+    return null;
+  }
 };
 
 /**
  * Validate and normalize connection data
+ * @param {unknown} connection - Connection data to validate
+ * @returns {object|null} Validated connection or null
  */
 const validateConnection = (connection) => {
-  if (!connection || typeof connection !== 'object' || !connection.userId) {
+  const validatedConnection = validateData(connection, ValidationSchema.connection);
+  if (!validatedConnection) {
     return null;
   }
-  
-  return {
-    userId: String(connection.userId),
-    strength: typeof connection.strength === 'number' ? connection.strength : 0.5,
-    mutualFollowers: Array.isArray(connection.mutualFollowers) ? connection.mutualFollowers : []
-  };
+
+  try {
+    return {
+      userId: String(validatedConnection.userId),
+      strength: typeof validatedConnection.strength === 'number' ? 
+        Math.max(0, Math.min(1, validatedConnection.strength)) : 0.5,
+      mutualFollowers: Array.isArray(validatedConnection.mutualFollowers) ? 
+        validatedConnection.mutualFollowers : []
+    };
+  } catch (error) {
+    console.error('Connection validation error:', error);
+    return null;
+  }
 };
 
 /**
- * Calculate suggestion score for a potential friend
+ * Safe calculation of suggestion score with error boundaries
+ * @param {object} user - User to calculate score for
+ * @param {object} currentUser - Current user
+ * @param {Array} connections - Existing connections
+ * @param {object} weights - Ranking weights
+ * @returns {number} Calculated score (0-1)
  */
 const calculateSuggestionScore = (user, currentUser, connections, weights) => {
   try {
-    // Get mutual followers
-    const userConnections = connections.filter(c => c.userId === user.id);
-    const mutualCount = userConnections.reduce((sum, conn) => sum + (conn.mutualFollowers?.length || 0), 0);
-    const mutualScore = Math.min(mutualCount / 10, 1);
+    if (!user || !currentUser || !Array.isArray(connections)) {
+      return 0;
+    }
 
-    // Calculate recent activity score
-    const daysSinceActive = (Date.now() - (user.lastActive || 0)) / (1000 * 60 * 60 * 24);
-    const activityScore = Math.max(0, 1 - (daysSinceActive / 30));
+    // Safely calculate mutual score
+    const userConnections = connections.filter(c => c?.userId === user.id);
+    const mutualCount = userConnections.reduce((sum, conn) => {
+      const mutualFollowers = conn?.mutualFollowers;
+      return sum + (Array.isArray(mutualFollowers) ? mutualFollowers.length : 0);
+    }, 0);
+    const mutualScore = Math.min(mutualCount / CONSTANTS.MUTUAL_FOLLOWERS_NORMALIZER, 1);
 
-    // Calculate shared interests score
+    // Safely calculate activity score
+    const lastActive = user.lastActive || 0;
+    const daysSinceActive = (Date.now() - lastActive) / (1000 * 60 * 60 * 24);
+    const activityScore = Math.max(0, 1 - (daysSinceActive / CONSTANTS.ACTIVITY_DECAY_DAYS));
+
+    // Safely calculate interests score
     const userInterests = user.interests || [];
     const currentUserInterests = currentUser.interests || [];
     const sharedInterests = userInterests.filter(interest => 
@@ -75,7 +215,7 @@ const calculateSuggestionScore = (user, currentUser, connections, weights) => {
     const interestsScore = userInterests.length > 0 ? 
       Math.min(sharedInterests / userInterests.length, 1) : 0;
 
-    // Calculate common groups score
+    // Safely calculate groups score
     const userGroups = user.groups || [];
     const currentUserGroups = currentUser.groups || [];
     const commonGroups = userGroups.filter(group => 
@@ -84,13 +224,15 @@ const calculateSuggestionScore = (user, currentUser, connections, weights) => {
     const groupsScore = userGroups.length > 0 ? 
       Math.min(commonGroups / userGroups.length, 1) : 0;
 
-    // Weighted final score
-    return (
+    // Calculate weighted final score
+    const finalScore = (
       mutualScore * weights.mutualFollowers +
       activityScore * weights.recentActivity +
       interestsScore * weights.sharedInterests +
       groupsScore * weights.commonGroups
     );
+
+    return Math.max(0, Math.min(1, finalScore)); // Ensure score is between 0 and 1
   } catch (error) {
     console.error('Error calculating suggestion score:', error);
     return 0;
@@ -98,37 +240,71 @@ const calculateSuggestionScore = (user, currentUser, connections, weights) => {
 };
 
 /**
- * Custom hook for offline storage management
+ * Safe localStorage operations with error handling and retry logic
+ * @param {string} key - Storage key
+ * @param {unknown} defaultValue - Default value if not found
+ * @returns {Array} [value, setter] tuple
  */
 const useOfflineStorage = (key, defaultValue) => {
   const [value, setValue] = useState(() => {
     try {
+      if (typeof window === 'undefined' || !window.localStorage) {
+        return defaultValue;
+      }
+      
       const item = localStorage.getItem(key);
       return item ? JSON.parse(item) : defaultValue;
     } catch (error) {
-      console.warn('Failed to read from localStorage:', error);
+      console.warn(`Failed to read from localStorage for key "${key}":`, error.message);
       return defaultValue;
     }
   });
 
   const setStoredValue = useCallback((newValue) => {
-    try {
-      setValue(newValue);
-      localStorage.setItem(key, JSON.stringify(newValue));
-    } catch (error) {
-      console.error('Failed to save to localStorage:', error);
-    }
+    const safeSetValue = (val) => {
+      try {
+        if (typeof window === 'undefined' || !window.localStorage) {
+          setValue(val);
+          return;
+        }
+
+        setValue(val);
+        localStorage.setItem(key, JSON.stringify(val));
+      } catch (error) {
+        console.error(`Failed to save to localStorage for key "${key}":`, error.message);
+        
+        // Retry after a delay if quota exceeded
+        if (error.name === 'QuotaExceededError') {
+          setTimeout(() => {
+            try {
+              localStorage.removeItem(key); // Clear corrupted data
+              localStorage.setItem(key, JSON.stringify(val));
+            } catch (retryError) {
+              console.error('Retry failed:', retryError.message);
+            }
+          }, CONSTANTS.STORAGE_RETRY_DELAY);
+        }
+      }
+    };
+
+    safeSetValue(newValue);
   }, [key]);
 
   return [value, setStoredValue];
 };
 
 /**
- * Custom hook for P2P sync using Automerge
+ * Safe P2P sync with comprehensive WebSocket error handling
+ * @param {string|null} docId - Document ID for sync
+ * @param {object} initialData - Initial document data
+ * @returns {Array} [doc, updateDoc] tuple
  */
 const useP2PSync = (docId, initialData) => {
   const [doc, setDoc] = useState(() => {
-    if (!Automerge) return initialData;
+    if (!Automerge || !docId) {
+      return initialData;
+    }
+    
     try {
       return Automerge.from(initialData);
     } catch (error) {
@@ -138,22 +314,48 @@ const useP2PSync = (docId, initialData) => {
   });
   
   const wsRef = useRef(null);
+  const reconnectTimeoutRef = useRef(null);
+
+  const cleanupWebSocket = useCallback(() => {
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+    
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+  }, []);
 
   const updateDoc = useCallback((updater) => {
-    if (!Automerge) return;
+    if (!Automerge || !docId) {
+      return;
+    }
     
     try {
       setDoc(currentDoc => {
+        if (!currentDoc) {
+          return currentDoc;
+        }
+        
         const newDoc = Automerge.change(currentDoc, updater);
         
-        // Broadcast changes to peers
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-          const changes = Automerge.getChanges(currentDoc, newDoc);
-          wsRef.current.send(JSON.stringify({
-            type: 'sync',
-            docId,
-            changes: changes.map(c => Array.from(c))
-          }));
+        // Safely broadcast changes to peers
+        const ws = wsRef.current;
+        if (ws && ws.readyState === CONSTANTS.WEBSOCKET_READY_STATE) {
+          try {
+            const changes = Automerge.getChanges(currentDoc, newDoc);
+            const message = JSON.stringify({
+              type: 'sync',
+              docId,
+              changes: changes.map(c => Array.from(c))
+            });
+            
+            ws.send(message);
+          } catch (sendError) {
+            console.error('Failed to send WebSocket message:', sendError);
+          }
         }
         
         return newDoc;
@@ -163,57 +365,101 @@ const useP2PSync = (docId, initialData) => {
     }
   }, [docId]);
 
-  // Initialize P2P connection
+  // Initialize P2P connection with retry logic
   useEffect(() => {
-    if (!Automerge || !docId) return;
-
-    try {
-      // Replace with your P2P signaling server
-      const ws = new WebSocket('wss://echo.websocket.org/');
-      wsRef.current = ws;
-
-      ws.onmessage = (event) => {
-        try {
-          const message = JSON.parse(event.data);
-          if (message.type === 'sync' && message.docId === docId) {
-            setDoc(currentDoc => {
-              const changes = message.changes.map(c => new Uint8Array(c));
-              return Automerge.applyChanges(currentDoc, changes);
-            });
-          }
-        } catch (error) {
-          console.error('P2P sync message error:', error);
-        }
-      };
-
-      ws.onerror = (error) => {
-        console.error('WebSocket error:', error);
-      };
-
-      return () => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.close();
-        }
-      };
-    } catch (error) {
-      console.error('Failed to initialize P2P connection:', error);
+    if (!Automerge || !docId) {
+      return undefined;
     }
-  }, [docId]);
+
+    const connectWebSocket = () => {
+      try {
+        // Use a more reliable WebSocket endpoint or implement your own
+        const ws = new WebSocket('wss://echo.websocket.org/');
+        wsRef.current = ws;
+
+        const timeoutId = setTimeout(() => {
+          if (ws.readyState !== CONSTANTS.WEBSOCKET_READY_STATE) {
+            ws.close();
+            console.warn('WebSocket connection timeout');
+          }
+        }, CONSTANTS.WEBSOCKET_TIMEOUT);
+
+        ws.onopen = () => {
+          clearTimeout(timeoutId);
+          console.log('WebSocket connected successfully');
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const message = JSON.parse(event.data);
+            if (message.type === 'sync' && message.docId === docId && Array.isArray(message.changes)) {
+              setDoc(currentDoc => {
+                if (!currentDoc) {
+                  return currentDoc;
+                }
+                
+                try {
+                  const changes = message.changes.map(c => new Uint8Array(c));
+                  return Automerge.applyChanges(currentDoc, changes);
+                } catch (applyError) {
+                  console.error('Failed to apply changes:', applyError);
+                  return currentDoc;
+                }
+              });
+            }
+          } catch (parseError) {
+            console.error('P2P sync message parse error:', parseError);
+          }
+        };
+
+        ws.onerror = (error) => {
+          console.error('WebSocket error:', error);
+          clearTimeout(timeoutId);
+        };
+
+        ws.onclose = () => {
+          clearTimeout(timeoutId);
+          console.log('WebSocket connection closed');
+          
+          // Implement reconnection logic
+          reconnectTimeoutRef.current = setTimeout(() => {
+            if (!wsRef.current || wsRef.current.readyState === WebSocket.CLOSED) {
+              console.log('Attempting to reconnect...');
+              connectWebSocket();
+            }
+          }, CONSTANTS.WEBSOCKET_TIMEOUT);
+        };
+      } catch (error) {
+        console.error('Failed to initialize WebSocket connection:', error);
+      }
+    };
+
+    connectWebSocket();
+
+    return cleanupWebSocket;
+  }, [docId, cleanupWebSocket]);
 
   return [doc, updateDoc];
 };
 
 /**
- * Generate fallback avatar URL
+ * Generate secure fallback avatar URL
+ * @param {string} name - User's name
+ * @returns {string} Avatar URL
  */
 const generateAvatarUrl = (name) => {
-  return `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&size=144&background=6D83F2&color=ffffff&font-size=0.6`;
+  if (!name || typeof name !== 'string') {
+    return `https://ui-avatars.com/api/?name=User&size=${CONSTANTS.AVATAR_SIZE}&background=6D83F2&color=ffffff&font-size=0.6`;
+  }
+  
+  const safeName = encodeURIComponent(name.trim().substring(0, 50)); // Limit length for URL safety
+  return `https://ui-avatars.com/api/?name=${safeName}&size=${CONSTANTS.AVATAR_SIZE}&background=6D83F2&color=ffffff&font-size=0.6`;
 };
 
 /**
- * Individual suggestion card component
+ * Memoized suggestion card component with comprehensive error handling
  */
-const SuggestionCard = ({ 
+const SuggestionCard = React.memo(({ 
   user, 
   currentUser, 
   connections, 
@@ -223,87 +469,142 @@ const SuggestionCard = ({
   debug = false
 }) => {
   const [isConnecting, setIsConnecting] = useState(false);
+  const [imageError, setImageError] = useState(false);
 
-  // Calculate display metrics safely
+  // Safely calculate display metrics with memoization
   const mutualConnections = useMemo(() => {
     try {
-      return connections.filter(c => 
-        c.mutualFollowers && c.mutualFollowers.includes(user.id)
-      ).length;
+      if (!Array.isArray(connections) || !user?.id) {
+        return 0;
+      }
+      
+      return connections.filter(c => {
+        const mutualFollowers = c?.mutualFollowers;
+        return Array.isArray(mutualFollowers) && mutualFollowers.includes(user.id);
+      }).length;
     } catch (error) {
-      if (debug) console.error('Error calculating mutual connections:', error);
+      if (debug) {
+        console.error('Error calculating mutual connections:', error);
+      }
       return 0;
     }
-  }, [connections, user.id, debug]);
+  }, [connections, user?.id, debug]);
 
   const sharedInterests = useMemo(() => {
     try {
-      const userInterests = user.interests || [];
-      const currentUserInterests = currentUser.interests || [];
-      return userInterests.filter(interest =>
-        currentUserInterests.includes(interest)
-      ).slice(0, 3);
+      const userInterests = user?.interests || [];
+      const currentUserInterests = currentUser?.interests || [];
+      
+      if (!Array.isArray(userInterests) || !Array.isArray(currentUserInterests)) {
+        return [];
+      }
+      
+      return userInterests
+        .filter(interest => currentUserInterests.includes(interest))
+        .slice(0, CONSTANTS.MAX_INTERESTS_DISPLAY);
     } catch (error) {
-      if (debug) console.error('Error calculating shared interests:', error);
+      if (debug) {
+        console.error('Error calculating shared interests:', error);
+      }
       return [];
     }
-  }, [user.interests, currentUser.interests, debug]);
+  }, [user?.interests, currentUser?.interests, debug]);
 
   const isRecentlyActive = useMemo(() => {
     try {
-      const lastActive = user.lastActive || 0;
-      return (Date.now() - lastActive) < (7 * 24 * 60 * 60 * 1000);
+      const lastActive = user?.lastActive || 0;
+      const daysSinceActive = (Date.now() - lastActive) / (1000 * 60 * 60 * 24);
+      return daysSinceActive < CONSTANTS.RECENT_ACTIVITY_DAYS;
     } catch (error) {
-      if (debug) console.error('Error checking recent activity:', error);
+      if (debug) {
+        console.error('Error checking recent activity:', error);
+      }
       return false;
     }
-  }, [user.lastActive, debug]);
+  }, [user?.lastActive, debug]);
 
   const avatarUrl = useMemo(() => {
-    return user.avatar || generateAvatarUrl(user.name);
-  }, [user.avatar, user.name]);
+    if (imageError || !user?.avatar) {
+      return generateAvatarUrl(user?.name);
+    }
+    return user.avatar;
+  }, [user?.avatar, user?.name, imageError]);
 
-  const handleConnect = async () => {
+  const handleConnect = useCallback(async () => {
+    if (isConnecting || !onConnect || !user) {
+      return;
+    }
+
     setIsConnecting(true);
     try {
       await onConnect(user);
+      
       // Simulate network delay for better UX
-      setTimeout(() => setIsConnecting(false), 1000);
+      setTimeout(() => {
+        setIsConnecting(false);
+      }, CONSTANTS.CONNECT_DELAY_MS);
     } catch (error) {
       console.error('Connection error:', error);
       setIsConnecting(false);
     }
-  };
+  }, [isConnecting, onConnect, user]);
+
+  const handleDismiss = useCallback((event) => {
+    event?.stopPropagation();
+    if (onDismiss && user?.id) {
+      onDismiss(user.id);
+    }
+  }, [onDismiss, user?.id]);
+
+  const handleClick = useCallback(() => {
+    if (onClick && user) {
+      onClick(user);
+    }
+  }, [onClick, user]);
+
+  const handleImageError = useCallback(() => {
+    setImageError(true);
+  }, []);
+
+  const handleKeyDown = useCallback((event) => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      handleClick();
+    }
+  }, [handleClick]);
+
+  if (!user || !user.id || !user.name) {
+    return null;
+  }
 
   return (
     <article className="card">
       <button 
         className="dismiss" 
-        onClick={(e) => {
-          e.stopPropagation();
-          onDismiss();
-        }}
-        aria-label="Dismiss suggestion"
+        onClick={handleDismiss}
+        aria-label={`Dismiss suggestion for ${user.name}`}
+        type="button"
       >
         ✕
       </button>
 
       <div 
         className={`avatar ${user.isOnline ? 'online' : 'offline'}`}
-        onClick={onClick}
+        onClick={handleClick}
         role="button"
         tabIndex={0}
+        onKeyDown={handleKeyDown}
+        aria-label={`View ${user.name}'s profile`}
       >
         <img 
           src={avatarUrl}
           alt={`${user.name}'s avatar`}
-          onError={(e) => {
-            e.target.src = generateAvatarUrl(user.name);
-          }}
+          onError={handleImageError}
+          loading="lazy"
         />
       </div>
 
-      <div className="card-content" onClick={onClick}>
+      <div className="card-content" onClick={handleClick}>
         <h3>{user.name}</h3>
         
         {mutualConnections > 0 && (
@@ -322,14 +623,14 @@ const SuggestionCard = ({
 
         {isRecentlyActive && (
           <div className="activity">
-            <span className="activity-dot"></span>
+            <span className="activity-dot" aria-hidden="true"></span>
             Recently active
           </div>
         )}
 
-        {debug && (
+        {debug && user.score !== undefined && (
           <div className="debug-score">
-            Score: {user.score?.toFixed(3) || 'N/A'}
+            Score: {user.score.toFixed(3)}
           </div>
         )}
       </div>
@@ -338,15 +639,45 @@ const SuggestionCard = ({
         className="connect"
         onClick={handleConnect}
         disabled={isConnecting}
+        type="button"
+        aria-label={`Connect with ${user.name}`}
       >
         {isConnecting ? 'Connecting...' : 'Connect'}
       </button>
     </article>
   );
+});
+
+// Add display name for debugging
+SuggestionCard.displayName = 'SuggestionCard';
+
+// Define PropTypes for type checking
+SuggestionCard.propTypes = {
+  user: PropTypes.shape({
+    id: PropTypes.string.isRequired,
+    name: PropTypes.string.isRequired,
+    avatar: PropTypes.string,
+    interests: PropTypes.arrayOf(PropTypes.string),
+    groups: PropTypes.arrayOf(PropTypes.string),
+    lastActive: PropTypes.number,
+    isOnline: PropTypes.bool,
+    score: PropTypes.number
+  }).isRequired,
+  currentUser: PropTypes.shape({
+    id: PropTypes.string.isRequired,
+    name: PropTypes.string.isRequired,
+    interests: PropTypes.arrayOf(PropTypes.string),
+    groups: PropTypes.arrayOf(PropTypes.string)
+  }).isRequired,
+  connections: PropTypes.arrayOf(PropTypes.object).isRequired,
+  onDismiss: PropTypes.func.isRequired,
+  onConnect: PropTypes.func.isRequired,
+  onClick: PropTypes.func,
+  debug: PropTypes.bool
 };
 
 /**
- * Main App component - Privacy-first social app with friend suggestions
+ * Main App component with comprehensive error boundaries and validation
  */
 const App = ({
   rankingWeights = DEFAULT_RANKING_WEIGHTS,
@@ -355,8 +686,8 @@ const App = ({
   className = '',
   debug = false
 }) => {
-  // Sample data that works out of the box
-  const [currentUser] = useState({
+  // Sample data with proper memoization
+  const currentUser = useMemo(() => ({
     id: 'user123',
     name: 'John Doe',
     avatar: 'https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?w=150&h=150&fit=crop&crop=face',
@@ -364,73 +695,17 @@ const App = ({
     groups: ['developers', 'music-lovers'],
     lastActive: Date.now(),
     isOnline: true
-  });
+  }), []);
 
-  const [allUsers] = useState([
-    {
-      id: 'user456',
-      name: 'Jane Smith',
-      avatar: 'https://images.unsplash.com/photo-1494790108755-2616b612b786?w=150&h=150&fit=crop&crop=face',
-      interests: ['music', 'art', 'travel'],
-      groups: ['developers', 'artists'],
-      lastActive: Date.now() - 86400000, // 1 day ago
-      isOnline: false
-    },
-    {
-      id: 'user789',
-      name: 'Bob Johnson',
-      avatar: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150&h=150&fit=crop&crop=face',
-      interests: ['tech', 'travel', 'gaming'],
-      groups: ['developers', 'gamers'],
-      lastActive: Date.now() - 3600000, // 1 hour ago
-      isOnline: true
-    },
-    {
-      id: 'user101',
-      name: 'Alice Brown',
-      avatar: 'https://images.unsplash.com/photo-1438761681033-6461ffad8d80?w=150&h=150&fit=crop&crop=face',
-      interests: ['cooking', 'music', 'yoga'],
-      groups: ['music-lovers', 'health'],
-      lastActive: Date.now() - 7200000, // 2 hours ago
-      isOnline: true
-    },
-    {
-      id: 'user202',
-      name: 'Charlie Wilson',
-      interests: ['tech', 'gaming', 'music'],
-      groups: ['developers', 'gamers'],
-      lastActive: Date.now() - 1800000, // 30 minutes ago
-      isOnline: true
-    },
-    {
-      id: 'user303',
-      name: 'Diana Ross',
-      avatar: 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=150&h=150&fit=crop&crop=face',
-      interests: ['music', 'art', 'cooking'],
-      groups: ['music-lovers', 'artists'],
-      lastActive: Date.now() - 10800000, // 3 hours ago
-      isOnline: false
-    },
-    {
-      id: 'user404',
-      name: 'Emma Wilson',
-      avatar: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&h=150&fit=crop&crop=face',
-      interests: ['yoga', 'travel', 'photography'],
-      groups: ['health', 'photographers'],
-      lastActive: Date.now() - 5400000, // 1.5 hours ago
-      isOnline: true
-    }
-  ]);
-
-  const [connections] = useState([
+  const connections = useMemo(() => [
     {
       userId: 'user999',
       strength: 0.8,
       mutualFollowers: ['user456', 'user789']
     }
-  ]);
+  ], []);
 
-  // Validate and normalize input data
+  // Validate and normalize input data with error handling
   const validatedCurrentUser = useMemo(() => {
     const validated = validateUser(currentUser);
     if (!validated && debug) {
@@ -440,12 +715,12 @@ const App = ({
   }, [currentUser, debug]);
 
   const validatedUsers = useMemo(() => {
-    const validated = allUsers.map(validateUser).filter(Boolean);
+    const validated = SAMPLE_USERS.map(validateUser).filter(Boolean);
     if (debug) {
-      console.log(`Validated ${validated.length} out of ${allUsers.length} users`);
+      console.log(`Validated ${validated.length} out of ${SAMPLE_USERS.length} users`);
     }
     return validated;
-  }, [allUsers, debug]);
+  }, [debug]);
 
   const validatedConnections = useMemo(() => {
     const validated = connections.map(validateConnection).filter(Boolean);
@@ -455,13 +730,13 @@ const App = ({
     return validated;
   }, [connections, debug]);
 
-  // Early return if no valid current user
+  // Error boundary for invalid current user
   if (!validatedCurrentUser) {
     return (
       <div className={`app-shell ${className}`}>
         <style>{globalCSS}</style>
         <div className="error-state">
-          <div className="error-icon">⚠️</div>
+          <div className="error-icon" aria-hidden="true">⚠️</div>
           <h3>Invalid User Data</h3>
           <p>Current user data is missing or invalid. Please check the user data.</p>
         </div>
@@ -469,44 +744,67 @@ const App = ({
     );
   }
 
-  // Offline storage for dismissed suggestions
+  // Offline storage with error handling
   const [dismissedSuggestions, setDismissedSuggestions] = useOfflineStorage(
     `dismissed_suggestions_${validatedCurrentUser.id}`, 
     []
   );
 
-  // P2P sync for suggestion data (optional)
+  // P2P sync with conditional initialization
   const [syncedData, updateSyncedData] = useP2PSync(
     enableP2PSync ? `suggestions_${validatedCurrentUser.id}` : null,
     { suggestions: [], lastUpdated: Date.now() }
   );
 
-  // Calculate and rank friend suggestions
+  // Calculate and rank friend suggestions with comprehensive error handling
   const suggestions = useMemo(() => {
     try {
+      if (!validatedUsers || !Array.isArray(validatedUsers)) {
+        return [];
+      }
+
       // Filter out current user, existing connections, and dismissed suggestions
       const connectedUserIds = validatedConnections.map(c => c.userId);
-      const candidateUsers = validatedUsers.filter(user => 
-        user.id !== validatedCurrentUser.id &&
-        !connectedUserIds.includes(user.id) &&
-        !dismissedSuggestions.includes(user.id)
-      );
+      const dismissedIds = Array.isArray(dismissedSuggestions) ? dismissedSuggestions : [];
+      
+      const candidateUsers = validatedUsers.filter(user => {
+        if (!user || !user.id) {
+          return false;
+        }
+        
+        return user.id !== validatedCurrentUser.id &&
+          !connectedUserIds.includes(user.id) &&
+          !dismissedIds.includes(user.id);
+      });
 
       if (debug) {
         console.log(`Found ${candidateUsers.length} candidate users for suggestions`);
       }
 
-      // Calculate scores and sort
+      // Calculate scores and sort with error handling
       const scoredSuggestions = candidateUsers
-        .map(user => ({
-          ...user,
-          score: calculateSuggestionScore(user, validatedCurrentUser, validatedConnections, rankingWeights)
-        }))
+        .map(user => {
+          const score = calculateSuggestionScore(
+            user, 
+            validatedCurrentUser, 
+            validatedConnections, 
+            rankingWeights
+          );
+          
+          return {
+            ...user,
+            score: Number.isFinite(score) ? score : 0
+          };
+        })
+        .filter(user => user.score > 0) // Filter out users with zero score
         .sort((a, b) => b.score - a.score)
-        .slice(0, maxSuggestions);
+        .slice(0, Math.max(1, Math.min(50, maxSuggestions))); // Ensure reasonable limits
 
       if (debug) {
-        console.log('Top suggestions:', scoredSuggestions.map(s => ({ name: s.name, score: s.score })));
+        console.log('Top suggestions:', scoredSuggestions.map(s => ({ 
+          name: s.name, 
+          score: s.score.toFixed(3) 
+        })));
       }
 
       return scoredSuggestions;
@@ -514,17 +812,34 @@ const App = ({
       console.error('Error calculating suggestions:', error);
       return [];
     }
-  }, [validatedUsers, validatedCurrentUser, validatedConnections, rankingWeights, maxSuggestions, dismissedSuggestions, debug]);
+  }, [
+    validatedUsers, 
+    validatedCurrentUser, 
+    validatedConnections, 
+    rankingWeights, 
+    maxSuggestions, 
+    dismissedSuggestions, 
+    debug
+  ]);
 
+  // Event handlers with proper error handling
   const handleDismiss = useCallback((userId) => {
+    if (!userId || typeof userId !== 'string') {
+      console.error('Invalid userId provided to handleDismiss');
+      return;
+    }
+
     try {
-      const newDismissed = [...dismissedSuggestions, userId];
+      const currentDismissed = Array.isArray(dismissedSuggestions) ? dismissedSuggestions : [];
+      const newDismissed = [...currentDismissed, userId];
       setDismissedSuggestions(newDismissed);
       
-      if (enableP2PSync && updateSyncedData) {
+      if (enableP2PSync && updateSyncedData && typeof updateSyncedData === 'function') {
         updateSyncedData(doc => {
-          doc.dismissed = newDismissed;
-          doc.lastUpdated = Date.now();
+          if (doc) {
+            doc.dismissed = newDismissed;
+            doc.lastUpdated = Date.now();
+          }
         });
       }
     } catch (error) {
@@ -533,40 +848,61 @@ const App = ({
   }, [dismissedSuggestions, setDismissedSuggestions, enableP2PSync, updateSyncedData]);
 
   const handleConnect = useCallback(async (user) => {
+    if (!user || !user.id || !user.name) {
+      console.error('Invalid user provided to handleConnect');
+      return;
+    }
+
     try {
       console.log('🤝 Connect request sent to:', user.name);
       
-      // Simulate API call
-      await new Promise(resolve => setTimeout(resolve, 800));
+      // Simulate API call with proper error handling
+      await new Promise((resolve, reject) => {
+        setTimeout(() => {
+          // Simulate occasional network failures for testing
+          if (Math.random() > 0.9) {
+            reject(new Error('Network timeout'));
+          } else {
+            resolve(undefined);
+          }
+        }, CONSTANTS.CONNECT_DELAY_MS);
+      });
       
       alert(`Connection request sent to ${user.name}!`);
       
-      if (enableP2PSync && updateSyncedData) {
+      if (enableP2PSync && updateSyncedData && typeof updateSyncedData === 'function') {
         updateSyncedData(doc => {
-          if (!doc.pendingConnections) doc.pendingConnections = [];
-          doc.pendingConnections.push({
-            userId: user.id,
-            timestamp: Date.now()
-          });
+          if (doc) {
+            if (!Array.isArray(doc.pendingConnections)) {
+              doc.pendingConnections = [];
+            }
+            doc.pendingConnections.push({
+              userId: user.id,
+              timestamp: Date.now()
+            });
+          }
         });
       }
     } catch (error) {
       console.error('Error handling connect request:', error);
+      alert(`Failed to send connection request to ${user.name}. Please try again.`);
     }
   }, [enableP2PSync, updateSyncedData]);
 
   const handleSuggestionClick = useCallback((user) => {
+    if (!user || !user.name) {
+      return;
+    }
     console.log('👁️ Viewing profile of:', user.name);
-    // In a real app, this would navigate to the user's profile
   }, []);
 
-  // Show loading state if no users provided
+  // Early returns for edge cases
   if (validatedUsers.length === 0) {
     return (
       <div className={`app-shell ${className}`}>
         <style>{globalCSS}</style>
         <div className="empty-state">
-          <div className="empty-icon">👥</div>
+          <div className="empty-icon" aria-hidden="true">👥</div>
           <h3>No users available</h3>
           <p>Loading user data...</p>
         </div>
@@ -574,7 +910,6 @@ const App = ({
     );
   }
 
-  // Show empty state for no suggestions
   if (suggestions.length === 0) {
     return (
       <div className={`app-shell ${className}`}>
@@ -586,7 +921,7 @@ const App = ({
         </header>
         
         <div className="empty-state">
-          <div className="empty-icon">🔍</div>
+          <div className="empty-icon" aria-hidden="true">🔍</div>
           <h3>No suggestions available</h3>
           <p>All available users are already connected or dismissed</p>
         </div>
@@ -621,7 +956,7 @@ const App = ({
                 <p>Current User: {validatedCurrentUser.name} ({validatedCurrentUser.id})</p>
                 <p>Total Users: {validatedUsers.length}</p>
                 <p>Connections: {validatedConnections.length}</p>
-                <p>Dismissed: {dismissedSuggestions.length}</p>
+                <p>Dismissed: {Array.isArray(dismissedSuggestions) ? dismissedSuggestions.length : 0}</p>
                 <p>P2P Sync: {enableP2PSync ? 'Enabled' : 'Disabled'}</p>
               </div>
             </details>
@@ -635,9 +970,9 @@ const App = ({
               user={user}
               currentUser={validatedCurrentUser}
               connections={validatedConnections}
-              onDismiss={() => handleDismiss(user.id)}
+              onDismiss={handleDismiss}
               onConnect={handleConnect}
-              onClick={() => handleSuggestionClick(user)}
+              onClick={handleSuggestionClick}
               debug={debug}
             />
           ))}
@@ -651,7 +986,21 @@ const App = ({
   );
 };
 
-/* ---------- GLOBAL CSS STYLES ---------- */
+// PropTypes for the main App component
+App.propTypes = {
+  rankingWeights: PropTypes.shape({
+    mutualFollowers: PropTypes.number,
+    recentActivity: PropTypes.number,
+    sharedInterests: PropTypes.number,
+    commonGroups: PropTypes.number
+  }),
+  maxSuggestions: PropTypes.number,
+  enableP2PSync: PropTypes.bool,
+  className: PropTypes.string,
+  debug: PropTypes.bool
+};
+
+/* ---------- ENHANCED CSS WITH ACCESSIBILITY IMPROVEMENTS ---------- */
 const globalCSS = `
 :root {
   --bg: #f9fafb;
@@ -678,6 +1027,7 @@ const globalCSS = `
   --radius-md: 12px;
   --radius-lg: 16px;
   --radius-xl: 24px;
+  --focus-ring: 0 0 0 3px rgba(102, 126, 234, 0.3);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -713,6 +1063,16 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
+/* Focus styles for accessibility */
+*:focus {
+  outline: none;
+}
+
+*:focus-visible {
+  box-shadow: var(--focus-ring);
+  outline: 2px solid transparent;
+}
+
 .app-shell {
   min-height: 100vh;
   padding: 24px;
@@ -720,7 +1080,6 @@ body {
   margin: 0 auto;
 }
 
-/* Brand Header */
 .brand {
   text-align: center;
   padding: 64px 16px 80px;
@@ -746,7 +1105,6 @@ body {
   font-weight: 400;
 }
 
-/* Section Header */
 .section-head {
   display: flex;
   justify-content: space-between;
@@ -773,7 +1131,6 @@ body {
   border: 1px solid var(--border);
 }
 
-/* Grid Layout */
 .grid {
   display: grid;
   gap: 24px;
@@ -787,7 +1144,6 @@ body {
   }
 }
 
-/* Card Styles */
 .card {
   position: relative;
   display: flex;
@@ -827,7 +1183,6 @@ body {
   opacity: 1;
 }
 
-/* Dismiss Button */
 .dismiss {
   position: absolute;
   top: 12px;
@@ -847,13 +1202,13 @@ body {
   z-index: 10;
 }
 
-.dismiss:hover {
+.dismiss:hover,
+.dismiss:focus-visible {
   background: var(--border);
   color: var(--text-sub);
   transform: scale(1.1);
 }
 
-/* Avatar */
 .avatar {
   width: 80px;
   height: 80px;
@@ -866,7 +1221,8 @@ body {
   cursor: pointer;
 }
 
-.avatar:hover {
+.avatar:hover,
+.avatar:focus-visible {
   transform: scale(1.05);
   border-color: var(--accent);
 }
@@ -899,7 +1255,6 @@ body {
   box-shadow: 0 0 0 2px var(--card-bg), 0 0 8px rgba(34, 197, 94, 0.3);
 }
 
-/* Card Content */
 .card-content {
   text-align: center;
   flex: 1;
@@ -922,7 +1277,6 @@ body {
   margin-bottom: 12px;
 }
 
-/* Tags */
 .tags {
   display: flex;
   gap: 8px;
@@ -947,7 +1301,6 @@ body {
   box-shadow: var(--shadow-sm);
 }
 
-/* Activity Indicator */
 .activity {
   display: flex;
   align-items: center;
@@ -976,7 +1329,6 @@ body {
   }
 }
 
-/* Connect Button */
 .connect {
   width: 100%;
   padding: 14px 24px;
@@ -1009,7 +1361,8 @@ body {
   left: 100%;
 }
 
-.connect:hover {
+.connect:hover,
+.connect:focus-visible {
   transform: translateY(-2px);
   box-shadow: var(--shadow-lg);
 }
@@ -1029,7 +1382,6 @@ body {
   box-shadow: none;
 }
 
-/* Empty/Error States */
 .empty-state,
 .error-state {
   text-align: center;
@@ -1068,7 +1420,6 @@ body {
   color: var(--danger);
 }
 
-/* Debug Info */
 .debug-info {
   margin-bottom: 24px;
   padding: 16px;
@@ -1088,6 +1439,11 @@ body {
   margin-bottom: 12px;
 }
 
+.debug-info summary:focus-visible {
+  box-shadow: var(--focus-ring);
+  border-radius: 4px;
+}
+
 .debug-content {
   font-family: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, monospace;
   color: var(--text-muted);
@@ -1101,7 +1457,6 @@ body {
   margin-top: 8px;
 }
 
-/* Footer */
 .footer {
   text-align: center;
   margin-top: 80px;
@@ -1111,7 +1466,6 @@ body {
   font-size: 0.875rem;
 }
 
-/* Responsive Design */
 @media (max-width: 480px) {
   .app-shell {
     padding: 16px;
@@ -1132,12 +1486,27 @@ body {
   }
 }
 
-/* Smooth animations */
 @media (prefers-reduced-motion: reduce) {
   * {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+  }
+}
+
+/* High contrast mode support */
+@media (prefers-contrast: high) {
+  :root {
+    --border: #000;
+    --border-hover: #333;
+    --shadow-sm: none;
+    --shadow-md: none;
+    --shadow-lg: none;
+    --shadow-xl: none;
+  }
+  
+  .card {
+    border: 2px solid var(--border);
   }
 }
 `;
