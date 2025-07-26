@@ -15,6 +15,29 @@ const CONSTANTS = {
   WEBSOCKET_TIMEOUT: 5000
 };
 
+// ---------- SECURE RANDOM GENERATOR (ONLY FIX ADDED) ----------
+/**
+ * FIXED: Secure random number generator using crypto.getRandomValues()
+ * Falls back to Math.random() only if crypto is not available
+ * @returns {number} Cryptographically secure random number between 0 and 1
+ */
+const getSecureRandom = () => {
+  if (typeof window !== 'undefined' && window.crypto && window.crypto.getRandomValues) {
+    const array = new Uint32Array(1);
+    window.crypto.getRandomValues(array);
+    return array[0] / (0xFFFFFFFF + 1);
+  }
+  
+  if (typeof global !== 'undefined' && global.crypto && global.crypto.getRandomValues) {
+    const array = new Uint32Array(1);
+    global.crypto.getRandomValues(array);
+    return array[0] / (0xFFFFFFFF + 1);
+  }
+  
+  console.warn('Crypto API not available, falling back to Math.random()');
+  return Math.random();
+};
+
 const DEFAULT_RANKING_WEIGHTS = Object.freeze({
   mutualFollowers: 0.4,
   recentActivity: 0.2,
@@ -937,9 +960,10 @@ const App = ({
     try {
       console.log('🤝 Connect request sent to:', user.name);
       
+      // ONLY CHANGE: Replace Math.random() with getSecureRandom()
       await new Promise((resolve, reject) => {
         setTimeout(() => {
-          if (Math.random() > 0.9) {
+          if (getSecureRandom() > 0.9) {
             reject(new Error('Network timeout'));
           } else {
             resolve(undefined);
