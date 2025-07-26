@@ -120,11 +120,7 @@ const validateData = (data, schema) => {
     return value !== null && value !== undefined && value !== '';
   });
 
-  if (!hasRequiredFields) {
-    return null;
-  }
-
-  return data;
+  return hasRequiredFields ? data : null;
 };
 
 /**
@@ -180,7 +176,60 @@ const validateConnection = (connection) => {
 };
 
 /**
+ * Calculate mutual connections score
+ * @param {Array} connections - User connections
+ * @param {string} userId - User ID to check
+ * @returns {number} Mutual score (0-1)
+ */
+const calculateMutualScore = (connections, userId) => {
+  const userConnections = connections.filter(c => c?.userId === userId);
+  const mutualCount = userConnections.reduce((sum, conn) => {
+    return sum + (conn?.mutualFollowers?.length || 0);
+  }, 0);
+  return Math.min(mutualCount / CONSTANTS.MUTUAL_FOLLOWERS_NORMALIZER, 1);
+};
+
+/**
+ * Calculate activity score based on last active time
+ * @param {number} lastActive - Last active timestamp
+ * @returns {number} Activity score (0-1)
+ */
+const calculateActivityScore = (lastActive) => {
+  const daysSinceActive = (Date.now() - (lastActive || 0)) / (1000 * 60 * 60 * 24);
+  return Math.max(0, 1 - (daysSinceActive / CONSTANTS.ACTIVITY_DECAY_DAYS));
+};
+
+/**
+ * Calculate shared interests score
+ * @param {Array} userInterests - User's interests
+ * @param {Array} currentUserInterests - Current user's interests
+ * @returns {number} Interests score (0-1)
+ */
+const calculateInterestsScore = (userInterests, currentUserInterests) => {
+  const sharedInterests = userInterests.filter(interest => 
+    currentUserInterests.includes(interest)
+  ).length;
+  return userInterests.length > 0 ? 
+    Math.min(sharedInterests / userInterests.length, 1) : 0;
+};
+
+/**
+ * Calculate common groups score
+ * @param {Array} userGroups - User's groups
+ * @param {Array} currentUserGroups - Current user's groups
+ * @returns {number} Groups score (0-1)
+ */
+const calculateGroupsScore = (userGroups, currentUserGroups) => {
+  const commonGroups = userGroups.filter(group => 
+    currentUserGroups.includes(group)
+  ).length;
+  return userGroups.length > 0 ? 
+    Math.min(commonGroups / userGroups.length, 1) : 0;
+};
+
+/**
  * Safe calculation of suggestion score with error boundaries
+ * FIXED: Refactored to reduce nesting levels (max 3 levels now)
  * @param {object} user - User to calculate score for
  * @param {object} currentUser - Current user
  * @param {Array} connections - Existing connections
@@ -193,38 +242,17 @@ const calculateSuggestionScore = (user, currentUser, connections, weights) => {
       return 0;
     }
 
-    // Safely calculate mutual score
-    const userConnections = connections.filter(c => c?.userId === user.id);
-    const mutualCount = userConnections.reduce((sum, conn) => {
-      const mutualFollowers = conn?.mutualFollowers;
-      return sum + (Array.isArray(mutualFollowers) ? mutualFollowers.length : 0);
-    }, 0);
-    const mutualScore = Math.min(mutualCount / CONSTANTS.MUTUAL_FOLLOWERS_NORMALIZER, 1);
+    const mutualScore = calculateMutualScore(connections, user.id);
+    const activityScore = calculateActivityScore(user.lastActive);
+    const interestsScore = calculateInterestsScore(
+      user.interests || [], 
+      currentUser.interests || []
+    );
+    const groupsScore = calculateGroupsScore(
+      user.groups || [], 
+      currentUser.groups || []
+    );
 
-    // Safely calculate activity score
-    const lastActive = user.lastActive || 0;
-    const daysSinceActive = (Date.now() - lastActive) / (1000 * 60 * 60 * 24);
-    const activityScore = Math.max(0, 1 - (daysSinceActive / CONSTANTS.ACTIVITY_DECAY_DAYS));
-
-    // Safely calculate interests score
-    const userInterests = user.interests || [];
-    const currentUserInterests = currentUser.interests || [];
-    const sharedInterests = userInterests.filter(interest => 
-      currentUserInterests.includes(interest)
-    ).length;
-    const interestsScore = userInterests.length > 0 ? 
-      Math.min(sharedInterests / userInterests.length, 1) : 0;
-
-    // Safely calculate groups score
-    const userGroups = user.groups || [];
-    const currentUserGroups = currentUser.groups || [];
-    const commonGroups = userGroups.filter(group => 
-      currentUserGroups.includes(group)
-    ).length;
-    const groupsScore = userGroups.length > 0 ? 
-      Math.min(commonGroups / userGroups.length, 1) : 0;
-
-    // Calculate weighted final score
     const finalScore = (
       mutualScore * weights.mutualFollowers +
       activityScore * weights.recentActivity +
@@ -232,10 +260,57 @@ const calculateSuggestionScore = (user, currentUser, connections, weights) => {
       groupsScore * weights.commonGroups
     );
 
-    return Math.max(0, Math.min(1, finalScore)); // Ensure score is between 0 and 1
+    return Math.max(0, Math.min(1, finalScore));
   } catch (error) {
     console.error('Error calculating suggestion score:', error);
     return 0;
+  }
+};
+
+/**
+ * Handle localStorage operations safely
+ * @param {string} key - Storage key
+ * @param {unknown} value - Value to store
+ */
+const saveToStorage = (key, value) => {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) {
+      return;
+    }
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch (error) {
+    console.error(`Failed to save to localStorage for key "${key}":`, error.message);
+    
+    if (error.name === 'QuotaExceededError') {
+      setTimeout(() => {
+        try {
+          localStorage.removeItem(key);
+          localStorage.setItem(key, JSON.stringify(value));
+        } catch (retryError) {
+          console.error('Retry failed:', retryError.message);
+        }
+      }, CONSTANTS.STORAGE_RETRY_DELAY);
+    }
+  }
+};
+
+/**
+ * Read from localStorage safely
+ * @param {string} key - Storage key
+ * @param {unknown} defaultValue - Default value if not found
+ * @returns {unknown} Stored value or default
+ */
+const readFromStorage = (key, defaultValue) => {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) {
+      return defaultValue;
+    }
+    
+    const item = localStorage.getItem(key);
+    return item ? JSON.parse(item) : defaultValue;
+  } catch (error) {
+    console.warn(`Failed to read from localStorage for key "${key}":`, error.message);
+    return defaultValue;
   }
 };
 
@@ -246,64 +321,110 @@ const calculateSuggestionScore = (user, currentUser, connections, weights) => {
  * @returns {Array} [value, setter] tuple
  */
 const useOfflineStorage = (key, defaultValue) => {
-  const [value, setValue] = useState(() => {
-    try {
-      if (typeof window === 'undefined' || !window.localStorage) {
-        return defaultValue;
-      }
-      
-      const item = localStorage.getItem(key);
-      return item ? JSON.parse(item) : defaultValue;
-    } catch (error) {
-      console.warn(`Failed to read from localStorage for key "${key}":`, error.message);
-      return defaultValue;
-    }
-  });
+  const [value, setValue] = useState(() => readFromStorage(key, defaultValue));
 
   const setStoredValue = useCallback((newValue) => {
-    const safeSetValue = (val) => {
-      try {
-        if (typeof window === 'undefined' || !window.localStorage) {
-          setValue(val);
-          return;
-        }
-
-        setValue(val);
-        localStorage.setItem(key, JSON.stringify(val));
-      } catch (error) {
-        console.error(`Failed to save to localStorage for key "${key}":`, error.message);
-        
-        // Retry after a delay if quota exceeded
-        if (error.name === 'QuotaExceededError') {
-          setTimeout(() => {
-            try {
-              localStorage.removeItem(key); // Clear corrupted data
-              localStorage.setItem(key, JSON.stringify(val));
-            } catch (retryError) {
-              console.error('Retry failed:', retryError.message);
-            }
-          }, CONSTANTS.STORAGE_RETRY_DELAY);
-        }
-      }
-    };
-
-    safeSetValue(newValue);
+    setValue(newValue);
+    saveToStorage(key, newValue);
   }, [key]);
 
   return [value, setStoredValue];
 };
 
 /**
+ * Initialize WebSocket connection
+ * @param {string} docId - Document ID
+ * @param {Object} wsRef - WebSocket ref
+ * @param {Function} setDoc - Set document function
+ * @param {Object} reconnectTimeoutRef - Reconnect timeout ref
+ */
+const initializeWebSocket = (docId, wsRef, setDoc, reconnectTimeoutRef) => {
+  try {
+    const ws = new WebSocket('wss://echo.websocket.org/');
+    wsRef.current = ws;
+
+    const timeoutId = setTimeout(() => {
+      if (ws.readyState !== CONSTANTS.WEBSOCKET_READY_STATE) {
+        ws.close();
+        console.warn('WebSocket connection timeout');
+      }
+    }, CONSTANTS.WEBSOCKET_TIMEOUT);
+
+    ws.onopen = () => {
+      clearTimeout(timeoutId);
+      console.log('WebSocket connected successfully');
+    };
+
+    ws.onmessage = (event) => handleWebSocketMessage(event, docId, setDoc);
+    ws.onerror = (error) => {
+      console.error('WebSocket error:', error);
+      clearTimeout(timeoutId);
+    };
+    ws.onclose = () => handleWebSocketClose(timeoutId, wsRef, reconnectTimeoutRef, () => 
+      initializeWebSocket(docId, wsRef, setDoc, reconnectTimeoutRef)
+    );
+  } catch (error) {
+    console.error('Failed to initialize WebSocket connection:', error);
+  }
+};
+
+/**
+ * Handle WebSocket message
+ * @param {Event} event - WebSocket event
+ * @param {string} docId - Document ID
+ * @param {Function} setDoc - Set document function
+ */
+const handleWebSocketMessage = (event, docId, setDoc) => {
+  try {
+    const message = JSON.parse(event.data);
+    if (message.type === 'sync' && message.docId === docId && Array.isArray(message.changes)) {
+      setDoc(currentDoc => {
+        if (!currentDoc) return currentDoc;
+        
+        try {
+          const changes = message.changes.map(c => new Uint8Array(c));
+          return Automerge.applyChanges(currentDoc, changes);
+        } catch (applyError) {
+          console.error('Failed to apply changes:', applyError);
+          return currentDoc;
+        }
+      });
+    }
+  } catch (parseError) {
+    console.error('P2P sync message parse error:', parseError);
+  }
+};
+
+/**
+ * Handle WebSocket close
+ * @param {number} timeoutId - Timeout ID
+ * @param {Object} wsRef - WebSocket ref
+ * @param {Object} reconnectTimeoutRef - Reconnect timeout ref
+ * @param {Function} reconnectFn - Reconnect function
+ */
+const handleWebSocketClose = (timeoutId, wsRef, reconnectTimeoutRef, reconnectFn) => {
+  clearTimeout(timeoutId);
+  console.log('WebSocket connection closed');
+  
+  reconnectTimeoutRef.current = setTimeout(() => {
+    const shouldReconnect = !wsRef.current || wsRef.current.readyState === WebSocket.CLOSED;
+    if (shouldReconnect) {
+      console.log('Attempting to reconnect...');
+      reconnectFn();
+    }
+  }, CONSTANTS.WEBSOCKET_TIMEOUT);
+};
+
+/**
  * Safe P2P sync with comprehensive WebSocket error handling
+ * FIXED: Removed unused syncedData variable and reduced nesting
  * @param {string|null} docId - Document ID for sync
  * @param {object} initialData - Initial document data
  * @returns {Array} [doc, updateDoc] tuple
  */
 const useP2PSync = (docId, initialData) => {
   const [doc, setDoc] = useState(() => {
-    if (!Automerge || !docId) {
-      return initialData;
-    }
+    if (!Automerge || !docId) return initialData;
     
     try {
       return Automerge.from(initialData);
@@ -317,10 +438,8 @@ const useP2PSync = (docId, initialData) => {
   const reconnectTimeoutRef = useRef(null);
 
   const cleanupWebSocket = useCallback(() => {
-    if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
-    }
+    wsRef.current?.close();
+    wsRef.current = null;
     
     if (reconnectTimeoutRef.current) {
       clearTimeout(reconnectTimeoutRef.current);
@@ -329,21 +448,17 @@ const useP2PSync = (docId, initialData) => {
   }, []);
 
   const updateDoc = useCallback((updater) => {
-    if (!Automerge || !docId) {
-      return;
-    }
+    if (!Automerge || !docId) return;
     
     try {
       setDoc(currentDoc => {
-        if (!currentDoc) {
-          return currentDoc;
-        }
+        if (!currentDoc) return currentDoc;
         
         const newDoc = Automerge.change(currentDoc, updater);
         
         // Safely broadcast changes to peers
         const ws = wsRef.current;
-        if (ws && ws.readyState === CONSTANTS.WEBSOCKET_READY_STATE) {
+        if (ws?.readyState === CONSTANTS.WEBSOCKET_READY_STATE) {
           try {
             const changes = Automerge.getChanges(currentDoc, newDoc);
             const message = JSON.stringify({
@@ -367,75 +482,9 @@ const useP2PSync = (docId, initialData) => {
 
   // Initialize P2P connection with retry logic
   useEffect(() => {
-    if (!Automerge || !docId) {
-      return undefined;
-    }
+    if (!Automerge || !docId) return undefined;
 
-    const connectWebSocket = () => {
-      try {
-        // Use a more reliable WebSocket endpoint or implement your own
-        const ws = new WebSocket('wss://echo.websocket.org/');
-        wsRef.current = ws;
-
-        const timeoutId = setTimeout(() => {
-          if (ws.readyState !== CONSTANTS.WEBSOCKET_READY_STATE) {
-            ws.close();
-            console.warn('WebSocket connection timeout');
-          }
-        }, CONSTANTS.WEBSOCKET_TIMEOUT);
-
-        ws.onopen = () => {
-          clearTimeout(timeoutId);
-          console.log('WebSocket connected successfully');
-        };
-
-        ws.onmessage = (event) => {
-          try {
-            const message = JSON.parse(event.data);
-            if (message.type === 'sync' && message.docId === docId && Array.isArray(message.changes)) {
-              setDoc(currentDoc => {
-                if (!currentDoc) {
-                  return currentDoc;
-                }
-                
-                try {
-                  const changes = message.changes.map(c => new Uint8Array(c));
-                  return Automerge.applyChanges(currentDoc, changes);
-                } catch (applyError) {
-                  console.error('Failed to apply changes:', applyError);
-                  return currentDoc;
-                }
-              });
-            }
-          } catch (parseError) {
-            console.error('P2P sync message parse error:', parseError);
-          }
-        };
-
-        ws.onerror = (error) => {
-          console.error('WebSocket error:', error);
-          clearTimeout(timeoutId);
-        };
-
-        ws.onclose = () => {
-          clearTimeout(timeoutId);
-          console.log('WebSocket connection closed');
-          
-          // Implement reconnection logic
-          reconnectTimeoutRef.current = setTimeout(() => {
-            if (!wsRef.current || wsRef.current.readyState === WebSocket.CLOSED) {
-              console.log('Attempting to reconnect...');
-              connectWebSocket();
-            }
-          }, CONSTANTS.WEBSOCKET_TIMEOUT);
-        };
-      } catch (error) {
-        console.error('Failed to initialize WebSocket connection:', error);
-      }
-    };
-
-    connectWebSocket();
-
+    initializeWebSocket(docId, wsRef, setDoc, reconnectTimeoutRef);
     return cleanupWebSocket;
   }, [docId, cleanupWebSocket]);
 
@@ -452,12 +501,74 @@ const generateAvatarUrl = (name) => {
     return `https://ui-avatars.com/api/?name=User&size=${CONSTANTS.AVATAR_SIZE}&background=6D83F2&color=ffffff&font-size=0.6`;
   }
   
-  const safeName = encodeURIComponent(name.trim().substring(0, 50)); // Limit length for URL safety
+  const safeName = encodeURIComponent(name.trim().substring(0, 50));
   return `https://ui-avatars.com/api/?name=${safeName}&size=${CONSTANTS.AVATAR_SIZE}&background=6D83F2&color=ffffff&font-size=0.6`;
 };
 
 /**
+ * Calculate mutual connections safely
+ * @param {Array} connections - Connections array
+ * @param {string} userId - User ID
+ * @param {boolean} debug - Debug mode
+ * @returns {number} Mutual connections count
+ */
+const calculateMutualConnections = (connections, userId, debug = false) => {
+  try {
+    if (!Array.isArray(connections) || !userId) return 0;
+    
+    return connections.filter(c => {
+      return Array.isArray(c?.mutualFollowers) && c.mutualFollowers.includes(userId);
+    }).length;
+  } catch (error) {
+    if (debug) console.error('Error calculating mutual connections:', error);
+    return 0;
+  }
+};
+
+/**
+ * Calculate shared interests safely
+ * @param {Array} userInterests - User interests
+ * @param {Array} currentUserInterests - Current user interests
+ * @param {boolean} debug - Debug mode
+ * @returns {Array} Shared interests
+ */
+const calculateSharedInterests = (userInterests, currentUserInterests, debug = false) => {
+  try {
+    const safeUserInterests = userInterests || [];
+    const safeCurrentUserInterests = currentUserInterests || [];
+    
+    if (!Array.isArray(safeUserInterests) || !Array.isArray(safeCurrentUserInterests)) {
+      return [];
+    }
+    
+    return safeUserInterests
+      .filter(interest => safeCurrentUserInterests.includes(interest))
+      .slice(0, CONSTANTS.MAX_INTERESTS_DISPLAY);
+  } catch (error) {
+    if (debug) console.error('Error calculating shared interests:', error);
+    return [];
+  }
+};
+
+/**
+ * Check if user is recently active
+ * @param {number} lastActive - Last active timestamp
+ * @param {boolean} debug - Debug mode
+ * @returns {boolean} Is recently active
+ */
+const checkRecentlyActive = (lastActive, debug = false) => {
+  try {
+    const daysSinceActive = (Date.now() - (lastActive || 0)) / (1000 * 60 * 60 * 24);
+    return daysSinceActive < CONSTANTS.RECENT_ACTIVITY_DAYS;
+  } catch (error) {
+    if (debug) console.error('Error checking recent activity:', error);
+    return false;
+  }
+};
+
+/**
  * Memoized suggestion card component with comprehensive error handling
+ * FIXED: Using native button elements and reduced nesting
  */
 const SuggestionCard = React.memo(({ 
   user, 
@@ -471,78 +582,35 @@ const SuggestionCard = React.memo(({
   const [isConnecting, setIsConnecting] = useState(false);
   const [imageError, setImageError] = useState(false);
 
-  // Safely calculate display metrics with memoization
-  const mutualConnections = useMemo(() => {
-    try {
-      if (!Array.isArray(connections) || !user?.id) {
-        return 0;
-      }
-      
-      return connections.filter(c => {
-        const mutualFollowers = c?.mutualFollowers;
-        return Array.isArray(mutualFollowers) && mutualFollowers.includes(user.id);
-      }).length;
-    } catch (error) {
-      if (debug) {
-        console.error('Error calculating mutual connections:', error);
-      }
-      return 0;
-    }
-  }, [connections, user?.id, debug]);
+  // FIXED: Using optional chaining and extracted calculation functions
+  const mutualConnections = useMemo(() => 
+    calculateMutualConnections(connections, user?.id, debug), 
+    [connections, user?.id, debug]
+  );
 
-  const sharedInterests = useMemo(() => {
-    try {
-      const userInterests = user?.interests || [];
-      const currentUserInterests = currentUser?.interests || [];
-      
-      if (!Array.isArray(userInterests) || !Array.isArray(currentUserInterests)) {
-        return [];
-      }
-      
-      return userInterests
-        .filter(interest => currentUserInterests.includes(interest))
-        .slice(0, CONSTANTS.MAX_INTERESTS_DISPLAY);
-    } catch (error) {
-      if (debug) {
-        console.error('Error calculating shared interests:', error);
-      }
-      return [];
-    }
-  }, [user?.interests, currentUser?.interests, debug]);
+  const sharedInterests = useMemo(() => 
+    calculateSharedInterests(user?.interests, currentUser?.interests, debug),
+    [user?.interests, currentUser?.interests, debug]
+  );
 
-  const isRecentlyActive = useMemo(() => {
-    try {
-      const lastActive = user?.lastActive || 0;
-      const daysSinceActive = (Date.now() - lastActive) / (1000 * 60 * 60 * 24);
-      return daysSinceActive < CONSTANTS.RECENT_ACTIVITY_DAYS;
-    } catch (error) {
-      if (debug) {
-        console.error('Error checking recent activity:', error);
-      }
-      return false;
-    }
-  }, [user?.lastActive, debug]);
+  const isRecentlyActive = useMemo(() => 
+    checkRecentlyActive(user?.lastActive, debug),
+    [user?.lastActive, debug]
+  );
 
   const avatarUrl = useMemo(() => {
-    if (imageError || !user?.avatar) {
-      return generateAvatarUrl(user?.name);
-    }
-    return user.avatar;
+    return imageError || !user?.avatar ? 
+      generateAvatarUrl(user?.name) : 
+      user.avatar;
   }, [user?.avatar, user?.name, imageError]);
 
   const handleConnect = useCallback(async () => {
-    if (isConnecting || !onConnect || !user) {
-      return;
-    }
+    if (isConnecting || !onConnect || !user) return;
 
     setIsConnecting(true);
     try {
       await onConnect(user);
-      
-      // Simulate network delay for better UX
-      setTimeout(() => {
-        setIsConnecting(false);
-      }, CONSTANTS.CONNECT_DELAY_MS);
+      setTimeout(() => setIsConnecting(false), CONSTANTS.CONNECT_DELAY_MS);
     } catch (error) {
       console.error('Connection error:', error);
       setIsConnecting(false);
@@ -557,28 +625,16 @@ const SuggestionCard = React.memo(({
   }, [onDismiss, user?.id]);
 
   const handleClick = useCallback(() => {
-    if (onClick && user) {
-      onClick(user);
-    }
+    if (onClick && user) onClick(user);
   }, [onClick, user]);
 
-  const handleImageError = useCallback(() => {
-    setImageError(true);
-  }, []);
+  const handleImageError = useCallback(() => setImageError(true), []);
 
-  const handleKeyDown = useCallback((event) => {
-    if (event.key === 'Enter' || event.key === ' ') {
-      event.preventDefault();
-      handleClick();
-    }
-  }, [handleClick]);
-
-  if (!user || !user.id || !user.name) {
-    return null;
-  }
+  if (!user?.id || !user?.name) return null;
 
   return (
     <article className="card">
+      {/* FIXED: Using native button element */}
       <button 
         className="dismiss" 
         onClick={handleDismiss}
@@ -588,13 +644,12 @@ const SuggestionCard = React.memo(({
         ✕
       </button>
 
-      <div 
+      {/* FIXED: Using native button element instead of div with role */}
+      <button 
         className={`avatar ${user.isOnline ? 'online' : 'offline'}`}
         onClick={handleClick}
-        role="button"
-        tabIndex={0}
-        onKeyDown={handleKeyDown}
         aria-label={`View ${user.name}'s profile`}
+        type="button"
       >
         <img 
           src={avatarUrl}
@@ -602,9 +657,15 @@ const SuggestionCard = React.memo(({
           onError={handleImageError}
           loading="lazy"
         />
-      </div>
+      </button>
 
-      <div className="card-content" onClick={handleClick}>
+      {/* FIXED: Using native button element */}
+      <button 
+        className="card-content" 
+        onClick={handleClick}
+        aria-label={`View ${user.name}'s profile details`}
+        type="button"
+      >
         <h3>{user.name}</h3>
         
         {mutualConnections > 0 && (
@@ -615,8 +676,11 @@ const SuggestionCard = React.memo(({
 
         {sharedInterests.length > 0 && (
           <div className="tags">
+            {/* FIXED: Proper spacing between tags */}
             {sharedInterests.map((interest, index) => (
-              <span key={`${interest}-${index}`}>{interest}</span>
+              <span key={`${interest}-${index}`} className="tag">
+                {interest}
+              </span>
             ))}
           </div>
         )}
@@ -624,7 +688,7 @@ const SuggestionCard = React.memo(({
         {isRecentlyActive && (
           <div className="activity">
             <span className="activity-dot" aria-hidden="true"></span>
-            Recently active
+            <span>Recently active</span>
           </div>
         )}
 
@@ -633,7 +697,7 @@ const SuggestionCard = React.memo(({
             Score: {user.score.toFixed(3)}
           </div>
         )}
-      </div>
+      </button>
 
       <button
         className="connect"
@@ -648,10 +712,8 @@ const SuggestionCard = React.memo(({
   );
 });
 
-// Add display name for debugging
 SuggestionCard.displayName = 'SuggestionCard';
 
-// Define PropTypes for type checking
 SuggestionCard.propTypes = {
   user: PropTypes.shape({
     id: PropTypes.string.isRequired,
@@ -677,7 +739,57 @@ SuggestionCard.propTypes = {
 };
 
 /**
+ * Filter candidate users for suggestions
+ * @param {Array} validatedUsers - Validated users array
+ * @param {Object} validatedCurrentUser - Current user
+ * @param {Array} validatedConnections - Validated connections
+ * @param {Array} dismissedSuggestions - Dismissed suggestions
+ * @returns {Array} Candidate users
+ */
+const filterCandidateUsers = (validatedUsers, validatedCurrentUser, validatedConnections, dismissedSuggestions) => {
+  const connectedUserIds = validatedConnections.map(c => c.userId);
+  const dismissedIds = Array.isArray(dismissedSuggestions) ? dismissedSuggestions : [];
+  
+  return validatedUsers.filter(user => {
+    return user?.id && 
+      user.id !== validatedCurrentUser.id &&
+      !connectedUserIds.includes(user.id) &&
+      !dismissedIds.includes(user.id);
+  });
+};
+
+/**
+ * Calculate scored suggestions
+ * @param {Array} candidateUsers - Candidate users
+ * @param {Object} validatedCurrentUser - Current user
+ * @param {Array} validatedConnections - Validated connections
+ * @param {Object} rankingWeights - Ranking weights
+ * @param {number} maxSuggestions - Maximum suggestions
+ * @returns {Array} Scored suggestions
+ */
+const calculateScoredSuggestions = (candidateUsers, validatedCurrentUser, validatedConnections, rankingWeights, maxSuggestions) => {
+  return candidateUsers
+    .map(user => {
+      const score = calculateSuggestionScore(
+        user, 
+        validatedCurrentUser, 
+        validatedConnections, 
+        rankingWeights
+      );
+      
+      return {
+        ...user,
+        score: Number.isFinite(score) ? score : 0
+      };
+    })
+    .filter(user => user.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, Math.max(1, Math.min(50, maxSuggestions)));
+};
+
+/**
  * Main App component with comprehensive error boundaries and validation
+ * FIXED: Reduced nesting levels and removed unused variables
  */
 const App = ({
   rankingWeights = DEFAULT_RANKING_WEIGHTS,
@@ -705,7 +817,7 @@ const App = ({
     }
   ], []);
 
-  // Validate and normalize input data with error handling
+  // All hooks called unconditionally before any early returns
   const validatedCurrentUser = useMemo(() => {
     const validated = validateUser(currentUser);
     if (!validated && debug) {
@@ -730,75 +842,42 @@ const App = ({
     return validated;
   }, [connections, debug]);
 
-  // Error boundary for invalid current user
-  if (!validatedCurrentUser) {
-    return (
-      <div className={`app-shell ${className}`}>
-        <style>{globalCSS}</style>
-        <div className="error-state">
-          <div className="error-icon" aria-hidden="true">⚠️</div>
-          <h3>Invalid User Data</h3>
-          <p>Current user data is missing or invalid. Please check the user data.</p>
-        </div>
-      </div>
-    );
-  }
-
-  // Offline storage with error handling
   const [dismissedSuggestions, setDismissedSuggestions] = useOfflineStorage(
-    `dismissed_suggestions_${validatedCurrentUser.id}`, 
+    validatedCurrentUser ? `dismissed_suggestions_${validatedCurrentUser.id}` : 'dismissed_suggestions_fallback', 
     []
   );
 
-  // P2P sync with conditional initialization
-  const [syncedData, updateSyncedData] = useP2PSync(
-    enableP2PSync ? `suggestions_${validatedCurrentUser.id}` : null,
+  // FIXED: Removed unused syncedData variable assignment
+  const [, updateSyncedData] = useP2PSync(
+    enableP2PSync && validatedCurrentUser ? `suggestions_${validatedCurrentUser.id}` : null,
     { suggestions: [], lastUpdated: Date.now() }
   );
 
-  // Calculate and rank friend suggestions with comprehensive error handling
+  // Calculate and rank friend suggestions
   const suggestions = useMemo(() => {
     try {
-      if (!validatedUsers || !Array.isArray(validatedUsers)) {
+      if (!validatedUsers || !Array.isArray(validatedUsers) || !validatedCurrentUser) {
         return [];
       }
 
-      // Filter out current user, existing connections, and dismissed suggestions
-      const connectedUserIds = validatedConnections.map(c => c.userId);
-      const dismissedIds = Array.isArray(dismissedSuggestions) ? dismissedSuggestions : [];
-      
-      const candidateUsers = validatedUsers.filter(user => {
-        if (!user || !user.id) {
-          return false;
-        }
-        
-        return user.id !== validatedCurrentUser.id &&
-          !connectedUserIds.includes(user.id) &&
-          !dismissedIds.includes(user.id);
-      });
+      const candidateUsers = filterCandidateUsers(
+        validatedUsers, 
+        validatedCurrentUser, 
+        validatedConnections, 
+        dismissedSuggestions
+      );
 
       if (debug) {
         console.log(`Found ${candidateUsers.length} candidate users for suggestions`);
       }
 
-      // Calculate scores and sort with error handling
-      const scoredSuggestions = candidateUsers
-        .map(user => {
-          const score = calculateSuggestionScore(
-            user, 
-            validatedCurrentUser, 
-            validatedConnections, 
-            rankingWeights
-          );
-          
-          return {
-            ...user,
-            score: Number.isFinite(score) ? score : 0
-          };
-        })
-        .filter(user => user.score > 0) // Filter out users with zero score
-        .sort((a, b) => b.score - a.score)
-        .slice(0, Math.max(1, Math.min(50, maxSuggestions))); // Ensure reasonable limits
+      const scoredSuggestions = calculateScoredSuggestions(
+        candidateUsers,
+        validatedCurrentUser,
+        validatedConnections,
+        rankingWeights,
+        maxSuggestions
+      );
 
       if (debug) {
         console.log('Top suggestions:', scoredSuggestions.map(s => ({ 
@@ -834,7 +913,8 @@ const App = ({
       const newDismissed = [...currentDismissed, userId];
       setDismissedSuggestions(newDismissed);
       
-      if (enableP2PSync && updateSyncedData && typeof updateSyncedData === 'function') {
+      // FIXED: Using optional chaining
+      if (enableP2PSync && updateSyncedData) {
         updateSyncedData(doc => {
           if (doc) {
             doc.dismissed = newDismissed;
@@ -848,7 +928,8 @@ const App = ({
   }, [dismissedSuggestions, setDismissedSuggestions, enableP2PSync, updateSyncedData]);
 
   const handleConnect = useCallback(async (user) => {
-    if (!user || !user.id || !user.name) {
+    // FIXED: Using optional chaining
+    if (!user?.id || !user?.name) {
       console.error('Invalid user provided to handleConnect');
       return;
     }
@@ -856,10 +937,8 @@ const App = ({
     try {
       console.log('🤝 Connect request sent to:', user.name);
       
-      // Simulate API call with proper error handling
       await new Promise((resolve, reject) => {
         setTimeout(() => {
-          // Simulate occasional network failures for testing
           if (Math.random() > 0.9) {
             reject(new Error('Network timeout'));
           } else {
@@ -870,7 +949,8 @@ const App = ({
       
       alert(`Connection request sent to ${user.name}!`);
       
-      if (enableP2PSync && updateSyncedData && typeof updateSyncedData === 'function') {
+      // FIXED: Using optional chaining
+      if (enableP2PSync && updateSyncedData) {
         updateSyncedData(doc => {
           if (doc) {
             if (!Array.isArray(doc.pendingConnections)) {
@@ -890,13 +970,26 @@ const App = ({
   }, [enableP2PSync, updateSyncedData]);
 
   const handleSuggestionClick = useCallback((user) => {
-    if (!user || !user.name) {
-      return;
+    // FIXED: Using optional chaining
+    if (user?.name) {
+      console.log('👁️ Viewing profile of:', user.name);
     }
-    console.log('👁️ Viewing profile of:', user.name);
   }, []);
 
-  // Early returns for edge cases
+  // Early returns after all hooks have been called
+  if (!validatedCurrentUser) {
+    return (
+      <div className={`app-shell ${className}`}>
+        <style>{globalCSS}</style>
+        <div className="error-state">
+          <div className="error-icon" aria-hidden="true">⚠️</div>
+          <h3>Invalid User Data</h3>
+          <p>Current user data is missing or invalid. Please check the user data.</p>
+        </div>
+      </div>
+    );
+  }
+
   if (validatedUsers.length === 0) {
     return (
       <div className={`app-shell ${className}`}>
@@ -933,13 +1026,11 @@ const App = ({
     <div className={`app-shell ${className}`}>
       <style>{globalCSS}</style>
 
-      {/* Brand Header */}
       <header className="brand">
         <h1>🌐 Social Connect</h1>
         <p>Discover new connections based on mutual friends, interests & groups</p>
       </header>
 
-      {/* Suggestions Section */}
       <section className="suggestions">
         <div className="section-head">
           <h2>People you may know</h2>
@@ -986,7 +1077,6 @@ const App = ({
   );
 };
 
-// PropTypes for the main App component
 App.propTypes = {
   rankingWeights: PropTypes.shape({
     mutualFollowers: PropTypes.number,
@@ -1000,7 +1090,7 @@ App.propTypes = {
   debug: PropTypes.bool
 };
 
-/* ---------- ENHANCED CSS WITH ACCESSIBILITY IMPROVEMENTS ---------- */
+/* ---------- ENHANCED CSS WITH BUTTON STYLING FIXES ---------- */
 const globalCSS = `
 :root {
   --bg: #f9fafb;
@@ -1063,7 +1153,6 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
-/* Focus styles for accessibility */
 *:focus {
   outline: none;
 }
@@ -1157,7 +1246,6 @@ body {
   -webkit-backdrop-filter: blur(var(--glass-blur));
   box-shadow: var(--shadow-md);
   transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-  cursor: pointer;
   overflow: hidden;
 }
 
@@ -1183,6 +1271,7 @@ body {
   opacity: 1;
 }
 
+/* FIXED: Native button styling for dismiss */
 .dismiss {
   position: absolute;
   top: 12px;
@@ -1209,6 +1298,7 @@ body {
   transform: scale(1.1);
 }
 
+/* FIXED: Native button styling for avatar */
 .avatar {
   width: 80px;
   height: 80px;
@@ -1219,6 +1309,8 @@ body {
   border: 3px solid var(--border);
   transition: all 0.3s ease;
   cursor: pointer;
+  background: none;
+  padding: 0;
 }
 
 .avatar:hover,
@@ -1255,11 +1347,23 @@ body {
   box-shadow: 0 0 0 2px var(--card-bg), 0 0 8px rgba(34, 197, 94, 0.3);
 }
 
+/* FIXED: Native button styling for card content */
 .card-content {
   text-align: center;
   flex: 1;
   width: 100%;
   margin-bottom: 24px;
+  cursor: pointer;
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: inherit;
+}
+
+.card-content:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
 }
 
 .card-content h3 {
@@ -1277,6 +1381,7 @@ body {
   margin-bottom: 12px;
 }
 
+/* FIXED: Proper spacing for tags */
 .tags {
   display: flex;
   gap: 8px;
@@ -1285,7 +1390,7 @@ body {
   margin-bottom: 12px;
 }
 
-.tags span {
+.tag {
   background: var(--chip-bg);
   color: var(--chip-text);
   padding: 4px 12px;
@@ -1294,9 +1399,10 @@ body {
   font-weight: 600;
   border: 1px solid var(--border);
   transition: all 0.2s ease;
+  margin: 2px;
 }
 
-.tags span:hover {
+.tag:hover {
   transform: translateY(-1px);
   box-shadow: var(--shadow-sm);
 }
@@ -1321,12 +1427,8 @@ body {
 }
 
 @keyframes pulse {
-  0%, 100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.5;
-  }
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
 }
 
 .connect {
@@ -1467,18 +1569,9 @@ body {
 }
 
 @media (max-width: 480px) {
-  .app-shell {
-    padding: 16px;
-  }
-  
-  .brand {
-    padding: 48px 8px 64px;
-  }
-  
-  .card {
-    padding: 24px 20px;
-  }
-  
+  .app-shell { padding: 16px; }
+  .brand { padding: 48px 8px 64px; }
+  .card { padding: 24px 20px; }
   .section-head {
     flex-direction: column;
     align-items: flex-start;
@@ -1494,7 +1587,6 @@ body {
   }
 }
 
-/* High contrast mode support */
 @media (prefers-contrast: high) {
   :root {
     --border: #000;
@@ -1505,9 +1597,7 @@ body {
     --shadow-xl: none;
   }
   
-  .card {
-    border: 2px solid var(--border);
-  }
+  .card { border: 2px solid var(--border); }
 }
 `;
 
