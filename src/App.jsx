@@ -1,13 +1,4 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
-// In App.js
-import {
-  validateUser,
-  calculateSuggestionScore,
-  saveToStorage,
-  readFromStorage,
-  // ... other imports
-} from './utils/suggestionUtils';
-
 import PropTypes from 'prop-types';
 
 // Extracted constants to avoid magic numbers and repeated values
